@@ -447,7 +447,7 @@ def cmd_ci(a):
 
 def fmt_run(r):
     cols = [f"#{r.get('index_in_repo')}", r.get("status", "?"), r.get("workflow_id", "?"), r.get("event", ""),
-            short(r.get("commit_sha")), r.get("prettyref", "") if (r.get("prettyref") or "").startswith("#") else "",
+            short(r.get("commit_sha")), r.get("prettyref") or "",  # #N for a pull request, else the branch
             when(r.get("started") or r.get("created")), duration(r.get("duration")) if r.get("stopped") else "",
             (r.get("title") or "").split("\n")[0]]
     return "  ".join(c for c in cols if c)
