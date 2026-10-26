@@ -66,6 +66,10 @@ To type `fjo` in an ordinary shell, clone the repo anywhere and
   sent too.
 - Older runs may answer 500 for a job log whose files were cleaned up;
   `fjo log` says so per job and goes on.
+- Pull requests have no draft flag in the API: Forgejo derives `draft`
+  from a `WIP:` or `[WIP]` title prefix. `fjo pr open --draft`, `fjo pr
+  ready` and `fjo pr draft` add and strip the prefix; a title check
+  (commitlint) fails on the draft title until the PR is marked ready.
 
 ## Update
 

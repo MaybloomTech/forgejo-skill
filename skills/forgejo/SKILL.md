@@ -22,15 +22,22 @@ other.
    follows the repo's PR title rules (conventional-commit style where
    commitlint runs); the body says what changed, how it was verified and
    which card it closes. Write a long body to a file and pass `@path`
-   rather than quoting it in the command line.
+   rather than quoting it in the command line. `--draft` opens it as a
+   draft and `fjo pr ready N` marks it ready for review; `fjo pr draft
+   N` sets it back. Forgejo has no draft flag: the draft is a `WIP:`
+   title prefix, which these commands add and strip, so a title check
+   fails while the PR is a draft and passes once it is ready. Where a
+   review runner watches the forge, a draft gets no rounds, which is how
+   a PR is parked while it is not ready for one.
 2. `fjo pr checks N --wait` (or `fjo ci --wait` on the pushed commit)
    blocks until no context is pending and exits non-zero when CI is not
    green. When it is red: `fjo log RUN` prints the failed jobs' error
    lines and tail (RUN is the number in the status line and the web URL;
    `fjo log RUN JOB` picks one job, `--all` the whole log).
-3. `fjo pr show N` before acting on a PR: meta, body, CI state, then the
-   comments and reviews in order, clipped (`--full` for whole ones).
-   `fjo pr ls` is the open PRs with their CI and review state.
+3. `fjo pr show N` before acting on a PR: meta (a draft says so), body,
+   CI state, then the comments and reviews in order, clipped (`--full`
+   for whole ones). `fjo pr ls` is the open PRs with their CI and review
+   state; a draft's state reads `open,draft`.
 4. Respond on the PR, not in chat: `fjo pr comment N @note.md`, or a
    review (`fjo pr review N --approve|--request-changes -b @review.md
    --commit SHA`). Reviewing your own PR is not a review.
@@ -50,8 +57,9 @@ fjo pr ls [-s open|closed|all] [-n N] [--base B] [--author U] [--brief]   PRs wi
 fjo pr show N... [--full]                       meta, body, ci, comments and reviews in order
 fjo pr files N | fjo pr diff N [--patch]        what changed
 fjo pr checks N [--wait]                        commit statuses of the head (= fjo ci #N)
-fjo pr open -t TITLE [-b BODY] [--head BR] [--base B] [-a USER]
+fjo pr open -t TITLE [-b BODY] [--head BR] [--base B] [-a USER] [--draft]
 fjo pr edit N [-t TITLE] [-b BODY] [--base B]
+fjo pr ready N | fjo pr draft N                 lift or set the WIP: title prefix Forgejo reads the draft from
 fjo pr close N | fjo pr reopen N
 fjo pr comment N TEXT
 fjo pr review N [--approve|--request-changes] [-b BODY] [--commit SHA]

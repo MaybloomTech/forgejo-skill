@@ -26,6 +26,7 @@ PAGE = 50
 TAIL = 80  # lines of a job log `fjo log` prints by default
 ERR = re.compile(r"::error|\bFAIL\b|panic:|\berror\b|exit ?code|Process completed with|Job failed|failed with", re.I)
 ERRS = 15  # error lines shown before the tail of a failed job
+WIP = re.compile(r"^(wip:|\[wip\])\s*", re.I)  # Forgejo's default draft prefixes (a plain prefix match, as Forgejo does it)
 
 
 def cfg(name, default=None):
@@ -191,6 +192,22 @@ def text_arg(s):
     return s
 
 
+def is_draft_title(title):
+    """Forgejo derives a pull request's draft state from a WIP: or [WIP] title prefix."""
+    return bool(WIP.match(title or ""))
+
+
+def draft_title(title):
+    return title if is_draft_title(title) else f"WIP: {title}"
+
+
+def ready_title(title):
+    t = title or ""
+    while WIP.match(t):
+        t = WIP.sub("", t, count=1)
+    return t
+
+
 def pr_number(s):
     m = re.fullmatch(r"#?(\d+)", s.strip())
     if not m:
@@ -298,6 +315,7 @@ def cmd_pr_show(a):
         rev = review_summary(pages(f"{prefix}/pulls/{n}/reviews"))
         print(fmt_pr(p, ci, rev))
         meta = [f"base {(p.get('base') or {}).get('ref')}", f"head {sha}",
+                f"draft (title prefix; fjo pr ready {n} marks it ready)" if p.get("draft") else "",
                 "mergeable" if p.get("mergeable") else "conflicts" if p.get("state") == "open" else "",
                 f"+{p.get('additions', 0)} -{p.get('deletions', 0)} in {p.get('changed_files', 0)} files",
                 f"created {when(p.get('created_at'))}", f"updated {when(p.get('updated_at'))}",
@@ -339,12 +357,40 @@ def cmd_pr_open(a):
     if not head or head == "HEAD":
         sys.exit("no branch: pass --head BRANCH")
     base = a.base or (call("GET", prefix) or {}).get("default_branch") or "main"
-    body = {"title": a.title, "head": head, "base": base, "body": text_arg(a.body) or ""}
+    title = draft_title(a.title) if a.draft else a.title
+    body = {"title": title, "head": head, "base": base, "body": text_arg(a.body) or ""}
     if a.assignee:
         body["assignees"] = a.assignee
     p = call("POST", f"{prefix}/pulls", body)
     print(fmt_pr(p))
     print("  " + p.get("html_url", ""))
+    if p.get("draft"):
+        print(f"  draft: the title prefix makes it; fjo pr ready {p['number']} marks it ready for review")
+
+
+def cmd_pr_ready(a):
+    """Mark a draft ready for review: strip the WIP prefix Forgejo reads the draft state from."""
+    prefix = rp(a)
+    p = get_pr(prefix, a.number)
+    title = ready_title(p.get("title", ""))
+    if not p.get("draft") and title == p.get("title"):
+        print(fmt_pr(p))
+        print("  already ready for review")
+        return
+    if not title or title == p.get("title"):
+        sys.exit(f"fjo: #{a.number} is a draft by a title prefix fjo does not strip (the instance's own setting): fjo pr edit {a.number} -t TITLE")
+    print(fmt_pr(call("PATCH", f"{prefix}/pulls/{a.number}", {"title": title})))
+
+
+def cmd_pr_draft(a):
+    """Set a pull request back to draft: prefix the title with WIP:."""
+    prefix = rp(a)
+    p = get_pr(prefix, a.number)
+    if p.get("draft") or is_draft_title(p.get("title", "")):
+        print(fmt_pr(p))
+        print("  already a draft")
+        return
+    print(fmt_pr(call("PATCH", f"{prefix}/pulls/{a.number}", {"title": draft_title(p.get("title", ""))})))
 
 
 def cmd_pr_edit(a):
@@ -719,8 +765,11 @@ def main():
     s.add_argument("-t", "--title", required=True); s.add_argument("-b", "--body", help="text, - for stdin, @path for a file")
     s.add_argument("--head", help="branch (default: the current one)"); s.add_argument("--base", help="default: the repo's default branch")
     s.add_argument("-a", "--assignee", action="append")
+    s.add_argument("--draft", action="store_true", help="open as a draft (a WIP: title prefix; fjo pr ready N lifts it)")
     s = add(pr, "edit", cmd_pr_edit, "change title, body or base"); s.add_argument("number", type=pr_number)
     s.add_argument("-t", "--title"); s.add_argument("-b", "--body", help="text, - for stdin, @path"); s.add_argument("--base")
+    s = add(pr, "ready", cmd_pr_ready, "mark a draft ready for review (strip the WIP: prefix)"); s.add_argument("number", type=pr_number)
+    s = add(pr, "draft", cmd_pr_draft, "set back to draft (prefix the title with WIP:)"); s.add_argument("number", type=pr_number)
     s = add(pr, "close", cmd_pr_state, "close without merging"); s.add_argument("number", type=pr_number); s.set_defaults(to="closed")
     s = add(pr, "reopen", cmd_pr_state, "reopen"); s.add_argument("number", type=pr_number); s.set_defaults(to="open")
     s = add(pr, "comment", cmd_pr_comment, "add a comment"); s.add_argument("number", type=pr_number)
