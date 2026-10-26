@@ -1,0 +1,16 @@
+{
+  "name": "forgejo-skill",
+  "owner": {
+    "name": "MaybloomTech"
+  },
+  "metadata": {
+    "description": "The Forgejo forge skill and its `fjo` client."
+  },
+  "plugins": [
+    {
+      "name": "forgejo",
+      "source": "./",
+      "description": "Skill + `fjo` client for the team's Forgejo forge."
+    }
+  ]
+}

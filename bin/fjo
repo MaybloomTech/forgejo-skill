@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+"""fjo: a small Forgejo client for coding agents. Prints one line per item.
+
+Config (first found wins):
+  FORGEJO_TOKEN / ~/.config/forgejo/token   API token (Settings -> Applications)
+  FORGEJO_URL   / ~/.config/forgejo/url     the instance, e.g. https://git.example.org
+  FORGEJO_REPO  / -R OWNER/REPO             else the git remote of the current directory
+                                            that points at the instance (origin first)
+
+Only the Python standard library; Forgejo API v1 (tested on 16.0).
+"""
+import argparse
+import datetime as dt
+import http.client
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+
+CFG = os.path.expanduser("~/.config/forgejo")
+CLIP = 240  # chars of a comment shown before pointing at --full
+PAGE = 50
+TAIL = 80  # lines of a job log `fjo log` prints by default
+ERR = re.compile(r"::error|\bFAIL\b|panic:|\berror\b|exit ?code|Process completed with|Job failed|failed with", re.I)
+ERRS = 15  # error lines shown before the tail of a failed job
+
+
+def cfg(name, default=None):
+    try:
+        with open(os.path.join(CFG, name)) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return default
+
+
+URL = (os.environ.get("FORGEJO_URL") or cfg("url") or "").rstrip("/")
+TOKEN = os.environ.get("FORGEJO_TOKEN") or cfg("token")
+
+
+class ApiError(Exception):
+    def __init__(self, code, text):
+        try:
+            text = json.loads(text).get("message") or text
+        except (ValueError, AttributeError):
+            pass
+        super().__init__(f"HTTP {code}: {text}")
+        self.code = code
+
+
+_conn = None
+
+
+def call(method, path, body=None, params=None, raw=False):
+    """One request under /api/v1 on one kept-alive connection per run. Returns
+    the parsed JSON (None for an empty answer), or the bytes when raw."""
+    global _conn
+    if not URL:
+        sys.exit("no instance URL: run `fjo init --url https://...` or set FORGEJO_URL")
+    if not TOKEN:
+        sys.exit("no token: run `fjo init` or set FORGEJO_TOKEN")
+    u = urllib.parse.urlsplit(URL)
+    target = u.path.rstrip("/") + "/api/v1" + path
+    if params:
+        target += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}, doseq=True)
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": "token " + TOKEN, "Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    for attempt in (1, 2):
+        if _conn is None:
+            cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+            _conn = cls(u.hostname, u.port, timeout=60)
+        try:
+            _conn.request(method, target, body=data, headers=headers)
+            r = _conn.getresponse()
+            out = r.read()
+            break
+        except (http.client.HTTPException, OSError):
+            _conn.close()  # the server dropped the idle connection: reconnect once
+            _conn = None
+            if attempt == 2:
+                raise
+    if r.status >= 400:
+        raise ApiError(r.status, out.decode(errors="replace")[:400].strip())
+    if raw:
+        return out
+    return json.loads(out) if out.strip() else None
+
+
+def pages(path, params=None, key=None, limit=None):
+    """Every page of a list endpoint (or the first `limit` items). Forgejo's
+    Actions endpoints ignore `limit` unless `page` is sent too, and wrap the
+    list in {key: [...], total_count}."""
+    out, page = [], 1
+    while True:
+        r = call("GET", path, params={**(params or {}), "page": page, "limit": PAGE})
+        chunk = r.get(key) or [] if key else (r or [])
+        out += chunk
+        if len(chunk) < PAGE or (limit and len(out) >= limit):
+            return out[:limit] if limit else out
+        page += 1
+
+
+# ---------- helpers ----------
+
+def git(*args, cwd=None):
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+
+def parse_remote(url):
+    """(host, owner/repo) of a git remote URL in any of its spellings."""
+    m = re.match(r"^https?://([\w.-]+)(?::\d+)?/(.+?)(?:\.git)?/?$", url.strip())
+    if not m:
+        m = re.match(r"^(?:ssh://)?(?:[\w.-]+@)?([\w.-]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$", url.strip())
+    if not m:
+        return None, None
+    parts = m.group(2).split("/")
+    return m.group(1), "/".join(parts[-2:]) if len(parts) >= 2 else None
+
+
+def repo_of(a):
+    """OWNER/REPO from -R, FORGEJO_REPO, or the remote of the current repo
+    that points at the instance (origin first)."""
+    r = getattr(a, "repo", None) or os.environ.get("FORGEJO_REPO")
+    if r:
+        host, name = parse_remote(r) if "://" in r or "@" in r else (None, r.strip("/"))
+        if name and name.count("/") == 1:
+            return name
+        sys.exit(f"not a repo: {r!r} (want OWNER/REPO)")
+    host = urllib.parse.urlsplit(URL).hostname
+    remotes = {}
+    for line in git("remote", "-v").splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            remotes.setdefault(parts[0], parts[1])
+    for name in ["origin"] + sorted(k for k in remotes if k != "origin"):
+        if name in remotes:
+            h, full = parse_remote(remotes[name])
+            if h == host and full:
+                return full
+    sys.exit(f"no git remote here points at {host}; pass -R OWNER/REPO")
+
+
+def rp(a):
+    """The /repos/{owner}/{repo} prefix for this command."""
+    o, r = repo_of(a).split("/")
+    return f"/repos/{urllib.parse.quote(o)}/{urllib.parse.quote(r)}"
+
+
+def short(sha):
+    return (sha or "")[:7]
+
+
+def when(s):
+    """An API timestamp as 'YYYY-MM-DD HH:MM' in local time ('' when unset)."""
+    if not s or s.startswith("0001-") or s.startswith("1970-"):
+        return ""
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def clip(text, full=False):
+    """The first two non-empty lines of a comment, at most CLIP chars, unless full."""
+    text = (text or "").strip()
+    if full:
+        return text
+    lines = [l for l in text.split("\n") if l.strip()]
+    out = "\n".join(lines[:2])
+    cut = len(lines) > 2 or len(out) > CLIP
+    return (out[:CLIP].rstrip() + " ...") if cut else out
+
+
+def indent(text, pad="    "):
+    return text.replace("\n", "\n" + pad)
+
+
+def text_arg(s):
+    """A body argument: literal text, - for stdin, @path for a file."""
+    if s is None:
+        return None
+    if s == "-":
+        return sys.stdin.read().strip()
+    if s.startswith("@") and os.path.exists(s[1:]):
+        with open(s[1:]) as f:
+            return f.read().strip()
+    return s
+
+
+def pr_number(s):
+    m = re.fullmatch(r"#?(\d+)", s.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"not a pull request number: {s}")
+    return int(m.group(1))
+
+
+def duration(ns):
+    s = int((ns or 0) / 1e9)
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+# ---------- pull requests ----------
+
+def review_summary(reviews):
+    """'approved(user)' / 'changes requested(user)' from the newest live
+    verdict per reviewer; '' when nobody has given one."""
+    newest = {}
+    for r in reviews:
+        if r.get("dismissed") or r.get("state") not in ("APPROVED", "REQUEST_CHANGES"):
+            continue
+        who = (r.get("user") or {}).get("login", "?")
+        if who not in newest or (r.get("submitted_at") or "") > (newest[who].get("submitted_at") or ""):
+            newest[who] = r
+    blocking = [u for u, r in newest.items() if r["state"] == "REQUEST_CHANGES"]
+    if blocking:
+        return "changes requested(" + ",".join(sorted(blocking)) + ")"
+    ok = [u for u, r in newest.items() if r["state"] == "APPROVED"]
+    return "approved(" + ",".join(sorted(ok)) + ")" if ok else ""
+
+
+def ci_state(prefix, sha):
+    """The combined commit status: ('success'|'pending'|'failure'|..., statuses).
+    '' when nothing has reported for the commit."""
+    r = call("GET", f"{prefix}/commits/{sha}/status") or {}
+    return r.get("state") or "", r.get("statuses") or []
+
+
+def fmt_pr(p, ci=None, review=None):
+    state = "merged" if p.get("merged") else p.get("state", "")
+    if p.get("draft"):
+        state += ",draft"
+    head = (p.get("head") or {})
+    branch = head.get("ref") or "?"
+    if branch.startswith("refs/pull/"):  # the branch is deleted: the label still names it
+        branch = (head.get("label") or branch).split(":")[-1]
+    cols = [f"#{p['number']}", state, f"{branch} -> {(p.get('base') or {}).get('ref', '?')}",
+            short(head.get("sha")), f"ci {ci}" if ci else "", f"review {review}" if review else "",
+            "@" + (p.get("user") or {}).get("login", "?"), when(p.get("updated_at")).split(" ")[0], p.get("title", "")]
+    return "  ".join(c for c in cols if c)
+
+
+def get_pr(prefix, n):
+    return call("GET", f"{prefix}/pulls/{n}")
+
+
+def pr_extras(prefix, p):
+    """(ci state, review summary) of a PR: two extra requests."""
+    ci = ci_state(prefix, (p.get("head") or {}).get("sha"))[0]
+    rev = review_summary(pages(f"{prefix}/pulls/{p['number']}/reviews"))
+    return ci, rev
+
+
+def cmd_pr_ls(a):
+    prefix = rp(a)
+    params = {"state": a.state, "sort": "recentupdate", "base": a.base, "poster": a.author}
+    prs = pages(f"{prefix}/pulls", params, limit=a.limit)
+    if a.json:
+        print(json.dumps(prs, indent=1))
+        return
+    for p in prs:
+        ci, rev = pr_extras(prefix, p) if p.get("state") == "open" and not a.brief else ("", "")
+        print(fmt_pr(p, ci, rev))
+    if not prs:
+        print(f"(no {a.state} pull requests in {repo_of(a)})")
+
+
+def conversation(prefix, n, full=False):
+    """Comments and reviews of a PR, oldest first, one clipped entry each."""
+    rows = []
+    for c in pages(f"{prefix}/issues/{n}/comments"):
+        rows.append((c.get("created_at") or "", f"  > {when(c.get('created_at'))} {(c.get('user') or {}).get('login', '?')}: "
+                     + indent(clip(c.get("body"), full))))
+    for r in pages(f"{prefix}/pulls/{n}/reviews"):
+        if r.get("state") == "PENDING":
+            continue
+        tags = [r.get("state", "?").lower().replace("_", " "), "dismissed" if r.get("dismissed") else "",
+                f"@{short(r.get('commit_id'))}" if r.get("commit_id") else "",
+                f"{r['comments_count']} inline" if r.get("comments_count") else ""]
+        head = f"  > {when(r.get('submitted_at'))} {(r.get('user') or {}).get('login', '?')} review [{', '.join(t for t in tags if t)}]"
+        body = clip(r.get("body"), full)
+        rows.append((r.get("submitted_at") or "", head + (": " + indent(body) if body else "")))
+    return [row for _, row in sorted(rows, key=lambda x: x[0])]
+
+
+def cmd_pr_show(a):
+    prefix = rp(a)
+    for n in a.number:
+        p = get_pr(prefix, n)
+        if a.json:
+            print(json.dumps(p, indent=1))
+            continue
+        sha = (p.get("head") or {}).get("sha")
+        ci, statuses = ci_state(prefix, sha)
+        rev = review_summary(pages(f"{prefix}/pulls/{n}/reviews"))
+        print(fmt_pr(p, ci, rev))
+        meta = [f"base {(p.get('base') or {}).get('ref')}", f"head {sha}",
+                "mergeable" if p.get("mergeable") else "conflicts" if p.get("state") == "open" else "",
+                f"+{p.get('additions', 0)} -{p.get('deletions', 0)} in {p.get('changed_files', 0)} files",
+                f"created {when(p.get('created_at'))}", f"updated {when(p.get('updated_at'))}",
+                f"merged {when(p.get('merged_at'))} by {(p.get('merged_by') or {}).get('login', '?')}" if p.get("merged") else "",
+                "reviewers " + ",".join(u.get("login", "?") for u in p.get("requested_reviewers") or []) if p.get("requested_reviewers") else "",
+                p.get("html_url", "")]
+        print("  " + " | ".join(m for m in meta if m))
+        if p.get("body"):
+            print("  " + indent(p["body"].strip(), "  "))
+        failing = [s for s in statuses if s.get("status") not in ("success", "skipped")]
+        if statuses:
+            print(f"  ci {ci}: {len(statuses)} contexts" + ("; not green: " + ", ".join(
+                f"{s['context']} {s['status']}" for s in failing) if failing else "") + "  (fjo pr checks N)")
+        for row in conversation(prefix, n, a.full):
+            print(row)
+        print()
+
+
+def cmd_pr_files(a):
+    prefix = rp(a)
+    for f in pages(f"{prefix}/pulls/{a.number}/files"):
+        flag = {"added": "A", "deleted": "D", "renamed": "R", "changed": "M", "modified": "M"}.get(f.get("status"), "M")
+        print(f"{flag}  {f.get('filename')}  +{f.get('additions', 0)} -{f.get('deletions', 0)}")
+
+
+def cmd_pr_diff(a):
+    sys.stdout.write(call("GET", f"{rp(a)}/pulls/{a.number}.{'patch' if a.patch else 'diff'}", raw=True).decode(errors="replace"))
+
+
+def cmd_pr_checks(a):
+    p = get_pr(rp(a), a.number)
+    a.ref = (p.get("head") or {}).get("sha")
+    cmd_ci(a)
+
+
+def cmd_pr_open(a):
+    prefix = rp(a)
+    head = a.head or git("rev-parse", "--abbrev-ref", "HEAD")
+    if not head or head == "HEAD":
+        sys.exit("no branch: pass --head BRANCH")
+    base = a.base or (call("GET", prefix) or {}).get("default_branch") or "main"
+    body = {"title": a.title, "head": head, "base": base, "body": text_arg(a.body) or ""}
+    if a.assignee:
+        body["assignees"] = a.assignee
+    p = call("POST", f"{prefix}/pulls", body)
+    print(fmt_pr(p))
+    print("  " + p.get("html_url", ""))
+
+
+def cmd_pr_edit(a):
+    prefix = rp(a)
+    changes = {k: v for k, v in [("title", a.title), ("body", text_arg(a.body)), ("base", a.base)] if v is not None}
+    if not changes:
+        sys.exit("nothing to change: -t, -b or --base")
+    print(fmt_pr(call("PATCH", f"{prefix}/pulls/{a.number}", changes)))
+
+
+def cmd_pr_state(a):
+    p = call("PATCH", f"{rp(a)}/pulls/{a.number}", {"state": a.to})
+    print(fmt_pr(p))
+
+
+def cmd_pr_comment(a):
+    c = call("POST", f"{rp(a)}/issues/{a.number}/comments", {"body": text_arg(a.text)})
+    print(f"#{a.number} comment {c.get('id')} by {(c.get('user') or {}).get('login', '?')}")
+
+
+def cmd_pr_review(a):
+    prefix = rp(a)
+    event = "APPROVED" if a.approve else "REQUEST_CHANGES" if a.request_changes else "COMMENT"
+    body = {"event": event, "body": text_arg(a.body) or ""}
+    if a.commit:
+        body["commit_id"] = a.commit
+    r = call("POST", f"{prefix}/pulls/{a.number}/reviews", body)
+    print(f"#{a.number} review {r.get('id')} {r.get('state', event).lower().replace('_', ' ')} @{short(r.get('commit_id'))}")
+
+
+def cmd_pr_merge(a):
+    prefix = rp(a)
+    p = get_pr(prefix, a.number)
+    sha = (p.get("head") or {}).get("sha")
+    if a.head and not sha.startswith(a.head):
+        sys.exit(f"#{a.number} head is {short(sha)}, not {a.head}: the branch moved; read it again before merging")
+    ci, statuses = ci_state(prefix, sha)
+    if statuses and ci != "success" and not a.force:
+        sys.exit(f"#{a.number} ci {ci} at {short(sha)}: not merging (--force overrides; fjo pr checks {a.number} shows why)")
+    if p.get("state") != "open":
+        sys.exit(f"#{a.number} is {p.get('state')}")
+    body = {"Do": a.method, "head_commit_id": sha, "delete_branch_after_merge": not a.keep_branch,
+            "MergeTitleField": a.title or f"{p['title']} (#{a.number})"}
+    if a.message is not None:
+        body["MergeMessageField"] = text_arg(a.message)
+    call("POST", f"{prefix}/pulls/{a.number}/merge", body)
+    print(fmt_pr(get_pr(prefix, a.number)))
+
+
+# ---------- commit status ----------
+
+def resolve_ref(a, ref):
+    """A sha, a branch, #N (the PR's head) or nothing (HEAD of the current repo)."""
+    m = re.fullmatch(r"#(\d+)", ref or "")
+    if m:
+        return (get_pr(rp(a), int(m.group(1))).get("head") or {}).get("sha")
+    if not ref:
+        ref = git("rev-parse", "HEAD")
+        if not ref:
+            sys.exit("not in a git repo: pass a sha, branch or #N")
+    return ref
+
+
+def print_statuses(sha, state, statuses):
+    print(f"{short(sha)}  {state or 'no statuses'}  {len(statuses)} contexts")
+    for s in sorted(statuses, key=lambda s: s.get("updated_at") or ""):
+        url = s.get("target_url") or ""
+        m = re.search(r"/actions/runs/(\d+)/jobs/(\d+)", url)
+        where = f"run {m.group(1)} job {m.group(2)}" if m else url
+        print(f"  {s.get('status', '?'):8} {s.get('context', '?')}  {where}  {when(s.get('updated_at'))}"
+              + (f"  {s['description']}" if s.get("description") and s.get("status") not in ("success", "pending") else ""))
+
+
+def cmd_ci(a):
+    prefix = rp(a)
+    sha = resolve_ref(a, getattr(a, "ref", None))
+    deadline = time.time() + a.timeout
+    said = False
+    while True:
+        state, statuses = ci_state(prefix, sha)
+        pending = [s for s in statuses if s.get("status") == "pending"]
+        done = statuses and not pending
+        if not a.wait or done or time.time() > deadline:
+            break
+        if not said:
+            print(f"waiting on {short(sha)}: {len(pending)} pending of {len(statuses)} contexts (every {a.interval}s, up to {a.timeout // 60} min)", file=sys.stderr)
+            said = True
+        time.sleep(a.interval)
+    if a.json:
+        print(json.dumps(statuses, indent=1))
+        return
+    print_statuses(sha, state, statuses)
+    if a.wait and not done:
+        sys.exit(f"timed out after {a.timeout}s with {len(pending)} pending")
+    if a.wait and state != "success":
+        sys.exit(1)
+
+
+# ---------- actions ----------
+
+def fmt_run(r):
+    cols = [f"#{r.get('index_in_repo')}", r.get("status", "?"), r.get("workflow_id", "?"), r.get("event", ""),
+            short(r.get("commit_sha")), r.get("prettyref", "") if (r.get("prettyref") or "").startswith("#") else "",
+            when(r.get("started") or r.get("created")), duration(r.get("duration")) if r.get("stopped") else "",
+            (r.get("title") or "").split("\n")[0]]
+    return "  ".join(c for c in cols if c)
+
+
+def cmd_runs(a):
+    prefix = rp(a)
+    params = {"status": a.status, "event": a.event, "workflow_id": a.workflow}
+    want = a.limit if not a.pr and not a.sha else None
+    runs = pages(f"{prefix}/actions/runs", params, key="workflow_runs", limit=want)
+    if a.pr:
+        runs = [r for r in runs if r.get("prettyref") == f"#{a.pr}"]
+    if a.sha:
+        runs = [r for r in runs if (r.get("commit_sha") or "").startswith(a.sha)]
+    runs = runs[:a.limit]
+    if a.json:
+        print(json.dumps(runs, indent=1))
+        return
+    for r in runs:
+        print(fmt_run(r))
+    if not runs:
+        print("(no runs)")
+
+
+def find_run(prefix, number):
+    """A run by the number the web UI shows (index_in_repo); id:N for the API id."""
+    if number.startswith("id:"):
+        return call("GET", f"{prefix}/actions/runs/{number[3:]}")
+    n = int(number.lstrip("#"))
+    found = (call("GET", f"{prefix}/actions/runs", params={"run_number": n, "page": 1, "limit": 5}) or {}).get("workflow_runs") or []
+    if not found:
+        sys.exit(f"no run #{n}")
+    return found[0]
+
+
+def run_jobs(prefix, run):
+    return call("GET", f"{prefix}/actions/runs/{run['id']}/jobs") or []
+
+
+def fmt_job(j):
+    return "  ".join(c for c in [f"job {j.get('id')}", j.get("status", "?"), j.get("name", "?"),
+                                 f"needs {','.join(j['needs'])}" if j.get("needs") else "",
+                                 f"attempt {j['attempt']}" if (j.get("attempt") or 1) > 1 else ""] if c)
+
+
+def cmd_jobs(a):
+    prefix = rp(a)
+    run = find_run(prefix, a.run)
+    jobs = run_jobs(prefix, run)
+    if a.json:
+        print(json.dumps(jobs, indent=1))
+        return
+    print(fmt_run(run))
+    for j in jobs:
+        print("  " + fmt_job(j))
+
+
+def tail_log(text, n, raw=False):
+    """The last n lines, without the runner's timestamp prefix (unless raw)."""
+    lines = text.rstrip("\n").split("\n") if text.strip() else []
+    if not raw:
+        lines = [re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", "", l) for l in lines]
+    return lines[-n:] if n else lines, len(lines)
+
+
+def cmd_log(a):
+    prefix = rp(a)
+    run = find_run(prefix, a.run)
+    jobs = run_jobs(prefix, run)
+    if a.job:
+        pick = [j for j in jobs if str(j.get("id")) == a.job or (j.get("name") or "").lower() == a.job.lower()]
+        if not pick:
+            sys.exit(f"no job {a.job!r} in run #{run.get('index_in_repo')}; have: " + ", ".join(j.get("name", "?") for j in jobs))
+    else:
+        pick = [j for j in jobs if j.get("status") in ("failure", "cancelled")] or jobs
+    print(fmt_run(run))
+    for j in pick:
+        try:
+            text = call("GET", f"{prefix}/actions/jobs/{j['id']}/logs", raw=True).decode(errors="replace")
+        except ApiError as e:
+            print(f"== {fmt_job(j)}: no log ({e})")
+            continue
+        lines, total = tail_log(text, 0 if a.all else a.lines, a.raw)
+        shown = "all" if len(lines) == total else f"last {len(lines)} of"
+        print(f"== {fmt_job(j)}: {shown} {total} lines" + ("" if len(lines) == total else " (--all for every line)"))
+        if j.get("status") == "failure" and len(lines) < total:
+            every, _ = tail_log(text, 0, a.raw)
+            errs = [l for l in every[:-len(lines)] if ERR.search(l)][-ERRS:]
+            if errs:
+                print(f"  -- {len(errs)} error lines before the tail --")
+                for l in errs:
+                    print("  " + l)
+                print("  -- tail --")
+        for l in lines:
+            print("  " + l)
+
+
+def cmd_dispatch(a):
+    prefix = rp(a)
+    ref = a.ref or (call("GET", prefix) or {}).get("default_branch") or "main"
+    body = {"ref": ref, "return_run_info": True}
+    if a.input:
+        body["inputs"] = dict(kv.split("=", 1) for kv in a.input)
+    r = call("POST", f"{prefix}/actions/workflows/{a.workflow}/dispatches", body)
+    print(f"dispatched {a.workflow} on {ref}" + (f": run #{r.get('index_in_repo', r.get('id'))}" if isinstance(r, dict) and r else ""))
+
+
+# ---------- repo, branches, variables, secrets ----------
+
+def cmd_repo(a):
+    r = call("GET", rp(a))
+    if a.json:
+        print(json.dumps(r, indent=1))
+        return
+    flags = [k for k in ("private", "archived", "mirror", "fork", "has_actions", "has_pull_requests") if r.get(k)]
+    print(f"{r.get('full_name')}  default {r.get('default_branch')}  {' '.join(flags)}  "
+          f"open prs {r.get('open_pr_counter', 0)}  pushed {when(r.get('updated_at'))}")
+    print(f"  {r.get('html_url')}  {r.get('ssh_url')}")
+    if r.get("description"):
+        print("  " + r["description"])
+    prot = pages(f"{rp(a)}/branch_protections")
+    for p in prot:
+        rules = [k for k in ("enable_push", "require_signed_commits", "block_on_rejected_reviews",
+                             "block_on_outdated_branch", "dismiss_stale_approvals") if p.get(k)]
+        print(f"  protected {p.get('branch_name') or p.get('rule_name')}: approvals {p.get('required_approvals', 0)}"
+              + (f", status checks {','.join(p['status_check_contexts'])}" if p.get("status_check_contexts") else "")
+              + (f", {' '.join(rules)}" if rules else "")
+              + (f", merge whitelist {','.join(p['merge_whitelist_usernames'])}" if p.get("merge_whitelist_usernames") else ""))
+
+
+def cmd_branches(a):
+    for b in pages(f"{rp(a)}/branches"):
+        c = b.get("commit") or {}
+        print("  ".join(x for x in [b.get("name"), short(c.get("id")), "protected" if b.get("protected") else "",
+                                    when(c.get("timestamp")).split(" ")[0], (c.get("message") or "").split("\n")[0][:70]] if x))
+
+
+def cmd_branch_rm(a):
+    for name in a.name:
+        call("DELETE", f"{rp(a)}/branches/{urllib.parse.quote(name, safe='')}")
+        print(f"deleted {name}")
+
+
+def cmd_vars(a):
+    rows = pages(f"{rp(a)}/actions/variables")
+    for v in rows:
+        print(f"{v.get('name')}={v.get('data')}")
+    if not rows:
+        print("(no variables)")
+
+
+def cmd_var_set(a):
+    prefix, name = rp(a), urllib.parse.quote(a.name, safe="")
+    try:
+        call("POST", f"{prefix}/actions/variables/{name}", {"value": a.value})
+    except ApiError as e:
+        if e.code not in (409, 400):
+            raise
+        call("PUT", f"{prefix}/actions/variables/{name}", {"value": a.value})
+    print(f"{a.name}={a.value}")
+
+
+def cmd_var_rm(a):
+    call("DELETE", f"{rp(a)}/actions/variables/{urllib.parse.quote(a.name, safe='')}")
+    print(f"deleted {a.name}")
+
+
+def cmd_secrets(a):
+    rows = pages(f"{rp(a)}/actions/secrets")
+    for s in rows:
+        print(f"{s.get('name')}  set {when(s.get('created_at'))}")
+    if not rows:
+        print("(no secrets)")
+
+
+def cmd_secret_set(a):
+    """The value comes from stdin (or --from-file), never from the command line."""
+    if a.from_file:
+        with open(a.from_file) as f:
+            value = f.read().strip()
+    else:
+        value = sys.stdin.read().strip()
+    if not value:
+        sys.exit("empty secret value (pipe it on stdin or --from-file PATH)")
+    call("PUT", f"{rp(a)}/actions/secrets/{urllib.parse.quote(a.name, safe='')}", {"data": value})
+    print(f"secret {a.name} set")
+
+
+def cmd_secret_rm(a):
+    call("DELETE", f"{rp(a)}/actions/secrets/{urllib.parse.quote(a.name, safe='')}")
+    print(f"deleted secret {a.name}")
+
+
+# ---------- misc ----------
+
+def cmd_api(a):
+    """Raw passthrough for what has no command yet. Prints the JSON answer."""
+    body = text_arg(a.body)
+    r = call(a.method.upper(), a.path if a.path.startswith("/") else "/" + a.path,
+             json.loads(body) if body else None, raw=True)
+    try:
+        print(json.dumps(json.loads(r), indent=1))
+    except ValueError:
+        sys.stdout.write(r.decode(errors="replace"))
+
+
+def cmd_whoami(a):
+    u = call("GET", "/user") or {}
+    print(f"{u.get('login')}  {u.get('full_name') or ''}  {'admin' if u.get('is_admin') else ''}  {URL}".rstrip())
+
+
+def cmd_init(a):
+    """Store the token (from stdin or --token-file, never argv) and the URL, test them."""
+    global TOKEN, URL, _conn
+    if a.token_file:
+        with open(os.path.expanduser(a.token_file)) as f:
+            token = f.read().strip()
+    else:
+        token = sys.stdin.read().strip()
+    if not token:
+        sys.exit("empty token: pipe it on stdin or pass --token-file PATH")
+    os.makedirs(CFG, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(CFG, "token"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    TOKEN, _conn = token, None
+    if a.url:
+        URL = a.url.strip().rstrip("/")
+        with open(os.path.join(CFG, "url"), "w") as f:
+            f.write(URL + "\n")
+    u = call("GET", "/user") or {}
+    repos = pages("/user/repos")
+    print(f"ok: {u.get('login')} at {URL}, {len(repos)} repos visible")
+
+
+# ---------- argparse ----------
+
+def main():
+    ap = argparse.ArgumentParser(prog="fjo", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(parent, name, f, help, repo=True, js=False):
+        s = parent.add_parser(name, help=help)
+        if repo:
+            s.add_argument("-R", "--repo", help="OWNER/REPO (default: the remote of the current directory)")
+        if js:
+            s.add_argument("--json", action="store_true", help="raw JSON")
+        s.set_defaults(f=f)
+        return s
+
+    s = add(sp, "init", cmd_init, "store the token (stdin or --token-file) and the URL, test them", repo=False)
+    s.add_argument("--url"); s.add_argument("--token-file", help="read the token from this file instead of stdin")
+    add(sp, "whoami", cmd_whoami, "the account behind the token", repo=False)
+
+    pr = sp.add_parser("pr", help="pull requests").add_subparsers(dest="sub", required=True)
+    s = add(pr, "ls", cmd_pr_ls, "pull requests, newest update first, with ci and review state", js=True)
+    s.add_argument("-s", "--state", choices=["open", "closed", "all"], default="open")
+    s.add_argument("-n", "--limit", type=int, default=30); s.add_argument("--base"); s.add_argument("--author")
+    s.add_argument("--brief", action="store_true", help="skip the ci and review lookups")
+    s = add(pr, "show", cmd_pr_show, "one pull request: meta, body, ci, comments and reviews in order", js=True)
+    s.add_argument("number", nargs="+", type=pr_number); s.add_argument("--full", action="store_true", help="whole comments")
+    s = add(pr, "files", cmd_pr_files, "files changed"); s.add_argument("number", type=pr_number)
+    s = add(pr, "diff", cmd_pr_diff, "the diff"); s.add_argument("number", type=pr_number)
+    s.add_argument("--patch", action="store_true", help="as a mail patch, with commit messages")
+    s = add(pr, "checks", cmd_pr_checks, "commit statuses of the head (like fjo ci #N)", js=True)
+    s.add_argument("number", type=pr_number); s.add_argument("--wait", action="store_true")
+    s.add_argument("--interval", type=int, default=20); s.add_argument("--timeout", type=int, default=1800)
+    s = add(pr, "open", cmd_pr_open, "open a pull request from a pushed branch")
+    s.add_argument("-t", "--title", required=True); s.add_argument("-b", "--body", help="text, - for stdin, @path for a file")
+    s.add_argument("--head", help="branch (default: the current one)"); s.add_argument("--base", help="default: the repo's default branch")
+    s.add_argument("-a", "--assignee", action="append")
+    s = add(pr, "edit", cmd_pr_edit, "change title, body or base"); s.add_argument("number", type=pr_number)
+    s.add_argument("-t", "--title"); s.add_argument("-b", "--body", help="text, - for stdin, @path"); s.add_argument("--base")
+    s = add(pr, "close", cmd_pr_state, "close without merging"); s.add_argument("number", type=pr_number); s.set_defaults(to="closed")
+    s = add(pr, "reopen", cmd_pr_state, "reopen"); s.add_argument("number", type=pr_number); s.set_defaults(to="open")
+    s = add(pr, "comment", cmd_pr_comment, "add a comment"); s.add_argument("number", type=pr_number)
+    s.add_argument("text", help="text, - for stdin, @path for a file")
+    s = add(pr, "review", cmd_pr_review, "submit a review: --approve, --request-changes or a comment")
+    s.add_argument("number", type=pr_number); g = s.add_mutually_exclusive_group()
+    g.add_argument("--approve", action="store_true"); g.add_argument("--request-changes", action="store_true")
+    s.add_argument("-b", "--body", help="text, - for stdin, @path"); s.add_argument("--commit", help="sha the review is about")
+    s = add(pr, "merge", cmd_pr_merge, "merge (squash by default) at the head it has now; refuses when ci is not green")
+    s.add_argument("number", type=pr_number)
+    s.add_argument("--method", choices=["squash", "merge", "rebase", "rebase-merge", "fast-forward-only"], default="squash")
+    s.add_argument("--title", help="merge commit subject (default: PR title (#N))"); s.add_argument("--message", help="merge commit body, - or @path")
+    s.add_argument("--head", help="the sha you reviewed: refuse if the branch moved")
+    s.add_argument("--keep-branch", action="store_true"); s.add_argument("--force", action="store_true", help="merge with ci pending or red")
+
+    s = add(sp, "ci", cmd_ci, "commit statuses of a sha, branch, #N (PR head) or HEAD; --wait blocks until none is pending", js=True)
+    s.add_argument("ref", nargs="?"); s.add_argument("--wait", action="store_true")
+    s.add_argument("--interval", type=int, default=20); s.add_argument("--timeout", type=int, default=1800)
+    s = add(sp, "runs", cmd_runs, "Actions runs, newest first", js=True)
+    s.add_argument("-n", "--limit", type=int, default=15); s.add_argument("--status", help="success, failure, cancelled, running, waiting")
+    s.add_argument("--event", help="push, pull_request, workflow_dispatch"); s.add_argument("--workflow", help="file name, e.g. ci.yml")
+    s.add_argument("--pr", type=int, help="runs of this pull request"); s.add_argument("--sha", help="runs of this commit (prefix ok)")
+    s = add(sp, "jobs", cmd_jobs, "jobs of a run (the number the web UI shows; id:N for the API id)", js=True); s.add_argument("run")
+    s = add(sp, "log", cmd_log, "tail of a run's job logs: the failed jobs by default, or one job by name or id")
+    s.add_argument("run"); s.add_argument("job", nargs="?"); s.add_argument("-n", "--lines", type=int, default=TAIL)
+    s.add_argument("--all", action="store_true", help="every line"); s.add_argument("--raw", action="store_true", help="keep timestamps")
+    s = add(sp, "dispatch", cmd_dispatch, "run a workflow by hand (workflow_dispatch)"); s.add_argument("workflow", help="file name, e.g. ci.yml")
+    s.add_argument("--ref", help="branch (default: the default branch)"); s.add_argument("-i", "--input", action="append", help="key=value")
+
+    add(sp, "repo", cmd_repo, "the repository: flags, default branch, protections", js=True)
+    add(sp, "branches", cmd_branches, "branches with their tip")
+    br = sp.add_parser("branch", help="branch changes").add_subparsers(dest="sub", required=True)
+    s = add(br, "rm", cmd_branch_rm, "delete branches"); s.add_argument("name", nargs="+")
+    add(sp, "vars", cmd_vars, "Actions variables of the repo")
+    v = sp.add_parser("var", help="Actions variables").add_subparsers(dest="sub", required=True)
+    s = add(v, "set", cmd_var_set, "create or update"); s.add_argument("name"); s.add_argument("value")
+    s = add(v, "rm", cmd_var_rm, "delete"); s.add_argument("name")
+    add(sp, "secrets", cmd_secrets, "Actions secret names of the repo")
+    sc = sp.add_parser("secret", help="Actions secrets").add_subparsers(dest="sub", required=True)
+    s = add(sc, "set", cmd_secret_set, "create or update; the value comes on stdin or --from-file")
+    s.add_argument("name"); s.add_argument("--from-file")
+    s = add(sc, "rm", cmd_secret_rm, "delete"); s.add_argument("name")
+    s = add(sp, "api", cmd_api, "raw request under /api/v1 (JSON out)", repo=False)
+    s.add_argument("method", help="GET, POST, PATCH, PUT, DELETE"); s.add_argument("path", help="e.g. /repos/o/r/releases")
+    s.add_argument("body", nargs="?", help="JSON, - for stdin, @path")
+
+    a = ap.parse_args()
+    try:
+        a.f(a)
+    except ApiError as e:
+        sys.exit(f"fjo: {e}")
+    except OSError as e:
+        sys.exit(f"fjo: cannot reach {URL}: {e}")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

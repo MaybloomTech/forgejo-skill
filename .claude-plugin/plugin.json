@@ -1,0 +1,15 @@
+{
+  "name": "forgejo",
+  "displayName": "Forgejo forge",
+  "description": "A team's Forgejo forge for coding agents: a skill for when and how to use it, and `fjo`, a client that prints one line per pull request, run, job or status, with job logs.",
+  "author": {
+    "name": "MaybloomTech"
+  },
+  "repository": "https://github.com/MaybloomTech/forgejo-skill",
+  "keywords": [
+    "forgejo",
+    "gitea",
+    "pull-requests",
+    "ci"
+  ]
+}

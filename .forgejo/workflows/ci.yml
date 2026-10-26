@@ -1,0 +1,23 @@
+# CI for pull requests to main and pushes to main: the client compiles
+# and its offline tests pass. This file is mirrored to GitHub, so nothing
+# about the instance goes in it.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile and run the offline tests
+        run: |
+          python3 -m py_compile bin/fjo
+          python3 -m unittest discover -s tests -v
